@@ -126,12 +126,12 @@ dsh plugin --profile desktop add https://github.com/Chip-G0202/dsh-deepseek-sear
 
 ## 验证与排错
 
-`verify.mjs` 会完全按 harness 的方式跑一次真实搜索（使用 `~/.dsh/.credentials.yaml` 里的真实账号 token，token 不会离开进程）：
+`scripts/verify.mjs` 会完全按 harness 的方式跑一次真实搜索（使用 `~/.dsh/.credentials.yaml` 里的真实账号 token，token 不会离开进程）：
 
 ```bash
 NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
-"$NODE" verify.mjs "查询词"              # 官方 Search API，约 0.4–0.6 秒，带 snippet
-"$NODE" verify.mjs "查询词" --messages   # 旧 Messages 后端，约 4–6 秒
+"$NODE" scripts/verify.mjs "查询词"              # 官方 Search API，约 0.4–0.6 秒，带 snippet
+"$NODE" scripts/verify.mjs "查询词" --messages   # 旧 Messages 后端，约 4–6 秒
 ```
 
 搜索失败时会返回结构化错误：`WEB_PROVIDER_CREDENTIAL_MISSING`（未登录且没有 API Key）、`WEB_PROVIDER_ERROR`（HTTP/网络问题，会附上实际使用的端点）、`WEB_ABORTED`（被取消）。如果账号登录被拒，重新登录 DeepSeek 即可，不需要改端点。

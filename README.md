@@ -128,12 +128,12 @@ Installed as a bundle, the row lives in this package's `cordis.patch.yml`. Overr
 
 ## Verifying and troubleshooting
 
-`verify.mjs` runs the provider exactly as the harness does, using the real account token from `~/.dsh/.credentials.yaml` (the token never leaves the process):
+`scripts/verify.mjs` runs the provider exactly as the harness does, using the real account token from `~/.dsh/.credentials.yaml` (the token never leaves the process):
 
 ```bash
 NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
-"$NODE" verify.mjs "query"              # official Search API, ~0.4–0.6 s, snippets included
-"$NODE" verify.mjs "query" --messages   # legacy Messages backend, ~4–6 s
+"$NODE" scripts/verify.mjs "query"              # official Search API, ~0.4–0.6 s, snippets included
+"$NODE" scripts/verify.mjs "query" --messages   # legacy Messages backend, ~4–6 s
 ```
 
 If search fails, the structured error names the cause: `WEB_PROVIDER_CREDENTIAL_MISSING` (not signed in and no API key), `WEB_PROVIDER_ERROR` (HTTP/network, with the endpoint that was used), or `WEB_ABORTED` (cancelled). If the account sign-in is rejected, sign in to DeepSeek again — the endpoint does not need changing.

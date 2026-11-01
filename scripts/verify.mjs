@@ -1,4 +1,5 @@
-// Standalone end-to-end check for @local/dsh-deepseek-search-account.
+// Standalone end-to-end check for dsh-deepseek-search-account (dev tool, not
+// shipped in the npm package).
 //
 // Runs the provider exactly as the harness would (stub ctx with the real
 // DeepSeek account token read from ~/.dsh/.credentials.yaml), performs one real
@@ -6,14 +7,14 @@
 //
 // Usage (the app bundles a Node runtime):
 //   NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
-//   "$NODE" verify.mjs                          # official Search API (default)
-//   "$NODE" verify.mjs "your query"
-//   "$NODE" verify.mjs "your query" --messages  # legacy Messages server tool
+//   "$NODE" scripts/verify.mjs                          # official Search API (default)
+//   "$NODE" scripts/verify.mjs "your query"
+//   "$NODE" scripts/verify.mjs "your query" --messages  # legacy Messages server tool
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createSearchProvider, name as pluginName, PROVIDER_ID } from "./provider.js";
+import { createSearchProvider, name as pluginName, PROVIDER_ID } from "../provider.js";
 
 const args = process.argv.slice(2);
 const messagesMode = args.includes("--messages");
