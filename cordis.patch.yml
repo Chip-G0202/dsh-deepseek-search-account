@@ -1,0 +1,31 @@
+# Bundle layer for dsh-deepseek-search-account.
+#
+# Registers the account-backed DeepSeek search provider on the `web` seam and
+# pins `web.searchProvider` to it, so the built-in `web_search` tool keeps
+# working when the session's chat model is NOT a DeepSeek Account model
+# (OpenCode Go, other third-party gateways) — the search then runs on the
+# signed-in DeepSeek account through the official Search API.
+#
+# Override the provider row from the profile patch with an id-targeted entry
+# that repeats `name: dsh-deepseek-search-account`:
+#
+#   - id: web-search-deepseek-account
+#     name: dsh-deepseek-search-account
+#     config:
+#       mode: search-api
+#       count: 8
+- insert:
+    - id: web-search-deepseek-account
+      name: dsh-deepseek-search-account
+      config:
+        mode: search-api
+        count: 10
+        sendOriginalQuestion: true
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    searchProvider: deepseek-account-search
+    # Restated because a patch replaces the row's whole config: without it the
+    # two registered fetch providers (http + DeepSeek fetch API) would be
+    # ambiguous and `web_fetch` would fail.
+    fetchProvider: http
