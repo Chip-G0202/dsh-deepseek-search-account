@@ -36,6 +36,16 @@
  * "使用 Anthropic API" guide, but each search costs a full auxiliary model turn
  * (thousands of input tokens plus output) and is slower.
  *
+ * Fetch backend
+ * -------------
+ * The same row also registers a fetch provider (`deepseek-account-fetch`) so
+ * `web_fetch` goes through the official Fetch API
+ * (`POST https://api.deepseek.com/v1/tools/fetch`) instead of the shipped
+ * anonymous `http` provider: one plain request, page content returned as
+ * Markdown, billed on the same account quota (5 元 / 1000 successful requests
+ * since 2026-11-01 00:00 Beijing; failed fetches are not billed). Set
+ * `fetchEnabled: false` to leave `web_fetch` on the shipped provider.
+ *
  * Authentication
  * --------------
  * Account sign-in first: `ctx.deepseekAccount.resolveToken(endpoint)` sent as
@@ -54,6 +64,9 @@ export const inject = ["web"];
 /** Stable id this provider registers under. */
 export const PROVIDER_ID = "deepseek-account-search";
 
+/** Stable id the fetch provider registers under (`web.fetchProvider`). */
+export const FETCH_PROVIDER_ID = "deepseek-account-fetch";
+
 const DEFAULT_MODE = "search-api";
 /** Search/Fetch API base, including the `/v1/tools` prefix; `/search` is appended. */
 const DEFAULT_SEARCH_API_BASE_URL = "https://api.deepseek.com/v1/tools";
@@ -66,6 +79,12 @@ const DEFAULT_MODEL = "deepseek-flash";
 const DEFAULT_API_VERSION = "2023-06-01";
 const DEFAULT_MAX_TOKENS = 4096;
 const DEFAULT_MAX_USES = 5;
+/** Default cap on the Markdown characters one fetch returns to the model. */
+const DEFAULT_FETCH_MAX_CHARS = 100_000;
+/** Default provider-side timeout for one Fetch API request (ms). */
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+/** Longest URL the Fetch API accepts, in characters. */
+const FETCH_URL_MAX_CHARS = 8192;
 /** Longest `ori_question` the Search API accepts, in characters. */
 const ORIGINAL_QUESTION_MAX_CHARS = 128;
 const SEARCH_BASE_URL_ENV = "DEEPSEEK_SEARCH_BASE_URL";
@@ -119,7 +138,9 @@ function readOptions(config) {
 		maxUses: isPositiveInteger(config.maxUses) ? config.maxUses : DEFAULT_MAX_USES,
 		apiKey: typeof config.apiKey === "string" && config.apiKey.length > 0 ? config.apiKey : undefined,
 		apiKeyEnv: typeof config.apiKeyEnv === "string" && config.apiKeyEnv.length > 0 ? config.apiKeyEnv : "DEEPSEEK_API_KEY",
-		sendOriginalQuestion: config.sendOriginalQuestion !== false
+		sendOriginalQuestion: config.sendOriginalQuestion !== false,
+		fetchMaxChars: isPositiveInteger(config.fetchMaxChars) ? config.fetchMaxChars : DEFAULT_FETCH_MAX_CHARS,
+		fetchTimeoutMs: isPositiveInteger(config.fetchTimeoutMs) ? config.fetchTimeoutMs : DEFAULT_FETCH_TIMEOUT_MS
 	};
 }
 
@@ -228,32 +249,147 @@ function mapMessagesResponse(payload) {
 	return { sources, truncated: false };
 }
 
-/** Add endpoint guidance to failures that occur after the request dispatch begins. */
-function endpointError(options, endpoint, message, cause) {
+/**
+ * Add endpoint guidance to failures that occur after the request dispatch
+ * begins. `scope` is the operation (`search` or `fetch`), which decides both
+ * the wording and the configuration knob named in the guidance.
+ */
+function endpointError(options, endpoint, message, cause, scope = "search") {
 	const guidance =
-		options.mode === "search-api"
-			? "Search endpoint configuration is separate from chat; set the row's `baseURL` (or web-deepseek-api.baseURL if you use the shipped Search API provider)."
-			: "Search endpoint configuration is separate from chat; set the row's `messagesBaseURL` (or web-search-deepseek.baseURL for the shipped provider).";
+		scope === "fetch"
+			? "Fetch endpoint configuration is separate from chat; set the row's `baseURL`."
+			: options.mode === "search-api"
+				? "Search endpoint configuration is separate from chat; set the row's `baseURL` (or web-deepseek-api.baseURL if you use the shipped Search API provider)."
+				: "Search endpoint configuration is separate from chat; set the row's `messagesBaseURL` (or web-search-deepseek.baseURL for the shipped provider).";
 	return webError(`${message}\n\nThe web request used endpoint ${JSON.stringify(endpoint)}. ${guidance}`, "WEB_PROVIDER_ERROR", cause);
 }
 
 /** Guide the user to re-login when DeepSeek rejects the account token. */
 function accountRejectedError(message) {
 	return webError(
-		`${message}\n\nDeepSeek rejected the account sign-in used for this web search. Sign in to DeepSeek again in the harness; ` +
-			"the search endpoint does not need changing.",
+		`${message}\n\nDeepSeek rejected the account sign-in used for this web request. Sign in to DeepSeek again in the harness; ` +
+			"the endpoint does not need changing.",
 		"WEB_PROVIDER_ERROR"
 	);
 }
 
-/** HTTP status-specific guidance for the Search API (public docs error table). */
-function searchStatusMessage(status, detail) {
-	let message = `DeepSeek Search API error (HTTP ${status})${detail !== undefined ? `: ${detail}` : ""}`;
-	if (status === 400) message += "\n\n请求参数不合法（query 长度 1–128 字符、count 1–50 等）。";
+/** HTTP status-specific guidance from the public Search / Fetch error table. */
+function statusMessage(scope, status, detail) {
+	const label = scope === "fetch" ? "Fetch" : "Search";
+	let message = `DeepSeek ${label} API error (HTTP ${status})${detail !== undefined ? `: ${detail}` : ""}`;
+	if (status === 400) {
+		message +=
+			scope === "fetch"
+				? "\n\nURL 不合法（必须是含 host 的 http/https 地址、不能携带用户名或密码、长度不超过 8192）。"
+				: "\n\n请求参数不合法（query 长度 1–128 字符、count 1–50 等）。";
+	}
 	if (status === 401) message += "\n\nAPI Key 缺失或无效。";
-	if (status === 402) message += "\n\nDeepSeek 账号余额不足，请先充值（搜索按成功请求计费，目前 5 元/1000 次）。";
-	if (status === 429) message += "\n\n超过 Search API 的 QPS 限制（账号级 100 QPS），请稍后重试。";
+	if (status === 402) message += "\n\nDeepSeek 账号余额不足，请先充值（Search/Fetch 按成功请求计费，目前 5 元/1000 次）。";
+	if (status === 403 && scope === "fetch") message += "\n\nFetch 请求被安全策略拒绝。";
+	if (status === 404 && scope === "fetch") {
+		message += "\n\nFetch 未能获取可用的网页内容（URL 不可用、被站点策略拦截、目标站点返回错误、内容类型不受支持或页面没有可提取的 Markdown 正文）。";
+	}
+	if (status === 408) message += "\n\n读取请求体超时，请稍后重试。";
+	if (status === 413) message += "\n\n请求体超过大小限制。";
+	if (status === 429) message += "\n\n超过 Search/Fetch 的账号级 QPS 限制（Search 100 QPS、Fetch 25 QPS），请稍后重试。";
+	if (status >= 500) message += "\n\n服务端错误，请稍后重试。";
 	return message;
+}
+
+/** Read one host service without letting a missing/disabled service throw. */
+function serviceNamed(ctx, serviceName) {
+	try {
+		return ctx.get?.(serviceName);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Resolve the DeepSeek API key from row config, the credentials service, or the environment. */
+async function resolveApiKey(ctx, options, signal) {
+	throwIfAborted(signal);
+	if (options.apiKey !== undefined) return options.apiKey;
+	const credentials = serviceNamed(ctx, "credentials");
+	if (credentials !== undefined && typeof credentials.resolve === "function") {
+		const resolved = await credentials.resolve(options.apiKeyEnv);
+		const value = resolved?.value;
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return envValue(options.apiKeyEnv);
+}
+
+/**
+ * Resolve authentication for one operation: account sign-in first (sent as
+ * `x-dsh-auth-token`, which the public Search/Fetch routes accept), then the
+ * DeepSeek API key (the official docs' Bearer scheme).
+ */
+async function resolveAuth(ctx, endpoint, options, signal) {
+	throwIfAborted(signal);
+	const account = serviceNamed(ctx, "deepseekAccount");
+	if (account !== undefined && typeof account.resolveToken === "function") {
+		try {
+			const token = await account.resolveToken(endpoint);
+			if (typeof token === "string" && token.length > 0) {
+				return { kind: "account", headers: { "x-dsh-auth-token": token } };
+			}
+		} catch {
+			// Fall through to the API key; an account failure alone is not fatal.
+		}
+	}
+	throwIfAborted(signal);
+	const apiKey = await resolveApiKey(ctx, options, signal);
+	if (apiKey === undefined) {
+		throw webError(
+			`DeepSeek web access has no account sign-in and no API key for "${options.apiKeyEnv}"; ` +
+				"sign in to DeepSeek (search and fetch then use the account sign-in), or store the key through the credentials service " +
+				"(the web Models page writes it), export it in the launching environment, or set a literal `apiKey` in the row config",
+			"WEB_PROVIDER_CREDENTIAL_MISSING"
+		);
+	}
+	return { kind: "api-key", headers: { authorization: `Bearer ${apiKey}`, "x-api-key": apiKey } };
+}
+
+/**
+ * Dispatch one JSON POST to the DeepSeek Search/Fetch API and return the parsed
+ * body. `scope` selects the operation-specific wording of failures.
+ */
+async function postJson(endpoint, headers, body, signal, authKind, options, scope = "search") {
+	let response;
+	try {
+		response = await fetch(endpoint, {
+			method: "POST",
+			redirect: "error",
+			headers: {
+				...headers,
+				"content-type": "application/json",
+				accept: "application/json",
+				"user-agent": USER_AGENT
+			},
+			body: JSON.stringify(body),
+			...(signal !== undefined ? { signal } : {})
+		});
+	} catch (error) {
+		if (error?.name === "TimeoutError") throw webError(`DeepSeek ${scope} request timed out`, "WEB_FETCH_TIMEOUT", error);
+		if (signal?.aborted === true || isAbortError(error)) throw webError(`DeepSeek ${scope} aborted`, "WEB_ABORTED", error);
+		throw endpointError(options, endpoint, `DeepSeek ${scope} request failed: ${String(error)}`, error, scope);
+	}
+	if (!response.ok) {
+		let detail;
+		try {
+			const parsed = await response.json();
+			detail = typeof parsed.error === "string" ? parsed.error : (parsed.error?.message ?? parsed.message);
+		} catch (error) {
+			if (signal?.aborted === true || isAbortError(error)) throw webError(`DeepSeek ${scope} aborted`, "WEB_ABORTED", error);
+		}
+		if (response.status === 401 && authKind === "account") throw accountRejectedError(statusMessage(scope, 401, detail));
+		throw endpointError(options, endpoint, statusMessage(scope, response.status, detail), undefined, scope);
+	}
+	try {
+		return await response.json();
+	} catch (error) {
+		if (signal?.aborted === true || isAbortError(error)) throw webError(`DeepSeek ${scope} aborted`, "WEB_ABORTED", error);
+		throw endpointError(options, endpoint, `DeepSeek returned an unprocessable response body: ${String(error)}`, error, scope);
+	}
 }
 
 /**
@@ -265,101 +401,11 @@ function searchStatusMessage(status, detail) {
  * @param config - the row config (mode/baseURL/count/apiKey/apiKeyEnv/model/...).
  */
 export function createSearchProvider(ctx, config = {}) {
-	const getService = (serviceName) => {
-		try {
-			return ctx.get?.(serviceName);
-		} catch {
-			return undefined;
-		}
-	};
-
-	const resolveApiKey = async (options, signal) => {
-		throwIfAborted(signal);
-		if (options.apiKey !== undefined) return options.apiKey;
-		const credentials = getService("credentials");
-		if (credentials !== undefined && typeof credentials.resolve === "function") {
-			const resolved = await credentials.resolve(options.apiKeyEnv);
-			const value = resolved?.value;
-			if (typeof value === "string" && value.length > 0) return value;
-		}
-		return envValue(options.apiKeyEnv);
-	};
-
-	/**
-	 * Resolve authentication for one operation: account sign-in first, then the
-	 * DeepSeek API key (the official docs' Bearer scheme).
-	 */
-	const resolveAuth = async (endpoint, options, signal) => {
-		throwIfAborted(signal);
-		const account = getService("deepseekAccount");
-		if (account !== undefined && typeof account.resolveToken === "function") {
-			try {
-				const token = await account.resolveToken(endpoint);
-				if (typeof token === "string" && token.length > 0) {
-					return { kind: "account", headers: { "x-dsh-auth-token": token } };
-				}
-			} catch {
-				// Fall through to the API key; an account failure alone is not fatal.
-			}
-		}
-		throwIfAborted(signal);
-		const apiKey = await resolveApiKey(options, signal);
-		if (apiKey === undefined) {
-			throw webError(
-				`DeepSeek search has no account sign-in and no API key for "${options.apiKeyEnv}"; ` +
-					"sign in to DeepSeek (search then uses the account sign-in), or store the key through the credentials service " +
-					"(the web Models page writes it), export it in the launching environment, or set a literal `apiKey` in the row config",
-				"WEB_PROVIDER_CREDENTIAL_MISSING"
-			);
-		}
-		return { kind: "api-key", headers: { authorization: `Bearer ${apiKey}`, "x-api-key": apiKey } };
-	};
-
-	/** Dispatch one JSON request; returns the parsed body. */
-	const postJson = async (endpoint, headers, body, signal, authKind) => {
-		let response;
-		try {
-			response = await fetch(endpoint, {
-				method: "POST",
-				redirect: "error",
-				headers: {
-					...headers,
-					"content-type": "application/json",
-					accept: "application/json",
-					"user-agent": USER_AGENT
-				},
-				body: JSON.stringify(body),
-				...(signal !== undefined ? { signal } : {})
-			});
-		} catch (error) {
-			if (signal?.aborted === true || isAbortError(error)) throw webError("DeepSeek search aborted", "WEB_ABORTED", error);
-			throw endpointError(readOptions(config), endpoint, `DeepSeek search request failed: ${String(error)}`, error);
-		}
-		const options = readOptions(config);
-		if (!response.ok) {
-			let detail;
-			try {
-				const parsed = await response.json();
-				detail = typeof parsed.error === "string" ? parsed.error : (parsed.error?.message ?? parsed.message);
-			} catch (error) {
-				if (signal?.aborted === true || isAbortError(error)) throw webError("DeepSeek search aborted", "WEB_ABORTED", error);
-			}
-			if (response.status === 401 && authKind === "account") throw accountRejectedError(searchStatusMessage(401, detail));
-			if (options.mode === "search-api") throw endpointError(options, endpoint, searchStatusMessage(response.status, detail));
-			throw endpointError(options, endpoint, options.mode === "search-api" ? searchStatusMessage(response.status, detail) : `DeepSeek API error (HTTP ${response.status})${detail !== undefined ? `: ${detail}` : ""}`);
-		}
-		try {
-			return await response.json();
-		} catch (error) {
-			if (signal?.aborted === true || isAbortError(error)) throw webError("DeepSeek search aborted", "WEB_ABORTED", error);
-			throw endpointError(options, endpoint, `DeepSeek returned an unprocessable response body: ${String(error)}`, error);
-		}
-	};
 
 	/** One official Search API call (`POST /v1/tools/search`). */
 	const searchViaSearchApi = async (request, options, signal) => {
 		const endpoint = `${options.searchBaseURL}/search`;
-		const auth = await resolveAuth(endpoint, options, signal);
+		const auth = await resolveAuth(ctx, endpoint, options, signal);
 		const count = Math.max(1, Math.min(options.count, request.maxResults ?? options.count, 50));
 		const question = options.sendOriginalQuestion ? boundedQuestion(latestUserQuestion(ctx)) : undefined;
 		const body = {
@@ -368,13 +414,13 @@ export function createSearchProvider(ctx, config = {}) {
 			need_content: false,
 			...(question !== undefined ? { ori_question: question } : {})
 		};
-		return mapSearchResponse(await postJson(endpoint, auth.headers, body, signal, auth.kind));
+		return mapSearchResponse(await postJson(endpoint, auth.headers, body, signal, auth.kind, options));
 	};
 
 	/** One legacy Anthropic-Messages turn with the native `web_search` server tool. */
 	const searchViaMessages = async (request, options, signal) => {
 		const endpoint = `${options.messagesBaseURL}/messages`;
-		const auth = await resolveAuth(endpoint, options, signal);
+		const auth = await resolveAuth(ctx, endpoint, options, signal);
 		const body = {
 			model: options.model,
 			max_tokens: options.maxTokens,
@@ -387,7 +433,7 @@ export function createSearchProvider(ctx, config = {}) {
 			tools: [{ type: "web_search_20250305", name: "web_search", max_uses: options.maxUses }],
 			thinking: { type: "disabled" }
 		};
-		const payload = await postJson(endpoint, { ...auth.headers, "anthropic-version": options.apiVersion }, body, signal, auth.kind);
+		const payload = await postJson(endpoint, { ...auth.headers, "anthropic-version": options.apiVersion }, body, signal, auth.kind, options);
 		return mapMessagesResponse(payload);
 	};
 
@@ -398,7 +444,7 @@ export function createSearchProvider(ctx, config = {}) {
 		available() {
 			const options = readOptions(config);
 			return (
-				Boolean(getService("deepseekAccount") ?? getService("credentials")) ||
+				Boolean(serviceNamed(ctx, "deepseekAccount") ?? serviceNamed(ctx, "credentials")) ||
 				envValue(options.apiKeyEnv) !== undefined ||
 				options.apiKey !== undefined
 			);
@@ -415,7 +461,95 @@ export function createSearchProvider(ctx, config = {}) {
 	};
 }
 
-/** Register the provider with `ctx.web`. */
+/** Validate a URL the official Fetch API will accept. */
+function validateFetchUrl(url) {
+	if (typeof url !== "string" || url.length === 0) throw webError("web fetch needs a URL", "WEB_INVALID_URL");
+	if (url.length > FETCH_URL_MAX_CHARS) {
+		throw webError(`URL is longer than the ${FETCH_URL_MAX_CHARS} characters the Fetch API accepts`, "WEB_INVALID_URL");
+	}
+	let parsed;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw webError(`invalid URL ${JSON.stringify(url)}`, "WEB_INVALID_URL");
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw webError(`unsupported URL scheme "${parsed.protocol}" (only http/https can be fetched)`, "WEB_INVALID_URL");
+	}
+	if (parsed.username !== "" || parsed.password !== "") {
+		throw webError("URL must not carry a username or password", "WEB_INVALID_URL");
+	}
+	return parsed;
+}
+
+/** Combine the caller's cancellation signal with the provider's own timeout. */
+function withFetchTimeout(signal, timeoutMs) {
+	if (typeof AbortSignal.timeout !== "function") return signal;
+	const timeout = AbortSignal.timeout(timeoutMs);
+	if (signal === undefined) return timeout;
+	return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, timeout]) : signal;
+}
+
+/**
+ * Create the DeepSeek-account-backed fetch provider.
+ *
+ * Registers as `deepseek-account-fetch` for `ctx.web.fetch()`: one call to the
+ * official Fetch API, page body returned as the seam's `text` body (already
+ * Markdown), so `web_fetch` renders it verbatim instead of converting HTML.
+ * The same account sign-in (or `DEEPSEEK_API_KEY`) used for search authenticates
+ * the request, and a successful fetch is billed on the same account quota.
+ *
+ * @param ctx - plugin context; sign-in and credentials are read lazily per fetch.
+ * @param config - the row config (baseURL/fetchMaxChars/fetchTimeoutMs/apiKey/...).
+ */
+export function createFetchProvider(ctx, config = {}) {
+	return {
+		id: FETCH_PROVIDER_ID,
+
+		/** Availability is a cheap local check; credentials are resolved per fetch. */
+		available() {
+			const options = readOptions(config);
+			return (
+				Boolean(serviceNamed(ctx, "deepseekAccount") ?? serviceNamed(ctx, "credentials")) ||
+				envValue(options.apiKeyEnv) !== undefined ||
+				options.apiKey !== undefined
+			);
+		},
+
+		/** Fetch one URL through the official Fetch API (`POST /v1/tools/fetch`). */
+		async fetch(request, signal) {
+			const options = readOptions(config);
+			throwIfAborted(signal);
+			const target = validateFetchUrl(request?.url);
+			const endpoint = `${options.searchBaseURL}/fetch`;
+			const auth = await resolveAuth(ctx, endpoint, options, signal);
+			const effectiveSignal = withFetchTimeout(signal, options.fetchTimeoutMs);
+			const payload = await postJson(
+				endpoint,
+				auth.headers,
+				{ url: target.toString() },
+				effectiveSignal,
+				auth.kind,
+				options,
+				"fetch"
+			);
+			if (typeof payload?.content !== "string" || payload.content.length === 0) {
+				throw webError("DeepSeek Fetch API returned no page content", "WEB_PROVIDER_ERROR");
+			}
+			const content = payload.content.slice(0, options.fetchMaxChars);
+			return {
+				url: target.toString(),
+				statusCode: 200,
+				body: { kind: "text", content },
+				truncated: content.length !== payload.content.length
+			};
+		}
+	};
+}
+
+/** Register the search and fetch providers with `ctx.web`. */
 export function apply(ctx, config) {
-	ctx.web.registerSearchProvider(createSearchProvider(ctx, config ?? {}));
+	const rowConfig = config ?? {};
+	ctx.web.registerSearchProvider(createSearchProvider(ctx, rowConfig));
+	ctx.web.registerFetchProvider(createFetchProvider(ctx, rowConfig));
 }
