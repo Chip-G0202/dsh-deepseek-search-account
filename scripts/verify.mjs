@@ -11,6 +11,7 @@
 //   "$NODE" scripts/verify.mjs "your query"
 //   "$NODE" scripts/verify.mjs "your query" --messages  # legacy Messages server tool
 //   "$NODE" scripts/verify.mjs --fetch "https://example.com"  # official Fetch API
+//   "$NODE" scripts/verify.mjs --fetch-fallback "https://raw.githubusercontent.com/..." # official failure -> local fallback
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,6 +21,7 @@ import { createFetchProvider, createSearchProvider, FETCH_PROVIDER_ID, name as p
 const args = process.argv.slice(2);
 const messagesMode = args.includes("--messages");
 const fetchMode = args.includes("--fetch");
+const fetchFallbackMode = args.includes("--fetch-fallback");
 const target = args.find((arg) => !arg.startsWith("--")) ?? (fetchMode ? "https://api-docs.deepseek.com/zh-cn/guides/search/" : "DeepSeek Harness");
 const query = target;
 
@@ -49,6 +51,40 @@ const ctx = {
 		return undefined;
 	}
 };
+
+// Stand-in for the shipped `http` fetch provider: proves the fallback wiring
+// without loading the app bundle. It performs a plain local fetch.
+const fakeHttpProvider = {
+	id: "http",
+	available: () => true,
+	async fetch(request) {
+		const response = await fetch(request.url);
+		const content = await response.text();
+		return { url: request.url, statusCode: response.status, body: { kind: "html", content }, truncated: false };
+	}
+};
+ctx.web = { fetchProviders: new Map([["http", fakeHttpProvider]]) };
+
+if (fetchFallbackMode) {
+	const url = target === "DeepSeek Harness" ? "https://raw.githubusercontent.com/jasonxu114514/opencode2api/b13bf6989ce4a8bd8dbd681d33dfdd3205e04b78/docs/management.zh-CN.md" : target;
+	const withFallback = createFetchProvider(ctx, {});
+	const result = await withFallback.fetch({ url });
+	console.log(`fallback=${"http"} statusCode=${result.statusCode} kind=${result.body.kind} chars=${result.body.content.length} url=${result.url}`);
+	const disabled = createFetchProvider(ctx, { fallbackFetchProvider: "none" });
+	let disabledError;
+	try {
+		await disabled.fetch({ url });
+	} catch (error) {
+		disabledError = error;
+	}
+	if (disabledError === undefined) {
+		console.error("FAILED: fallbackFetchProvider: none still produced a result");
+		process.exit(1);
+	}
+	console.log(`fallbackDisabledError=${disabledError.message.split("\n")[0]}`);
+	console.log("OK");
+	process.exit(0);
+}
 
 const config = messagesMode ? { mode: "messages" } : {};
 const fetchProvider = createFetchProvider(ctx, config);

@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-search-account",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek account-backed web search AND page fetching for DeepSeek Harness sessions whose chat model runs through a third-party subscription or gateway (e.g. OpenCode Go): keeps the built-in web_search and web_fetch working, on the official Search/Fetch API, without a DEEPSEEK_API_KEY.",
   "type": "module",
   "license": "MIT",

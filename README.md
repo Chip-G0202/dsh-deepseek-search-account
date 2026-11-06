@@ -37,6 +37,7 @@ With OpenCode Go as the chat provider, that check fails, the provider falls back
 - Registers a search provider named `deepseek-account-search` and a fetch provider named `deepseek-account-fetch` on the `ctx.web` seam.
 - Calls the official DeepSeek Search API (`POST https://api.deepseek.com/v1/tools/search`) by default — one HTTP request per search, about 0.5–1 second, returning `title`, `url`, `snippet` and `date`; no auxiliary model turn, no extra model tokens.
 - Calls the official DeepSeek Fetch API (`POST https://api.deepseek.com/v1/tools/fetch`) for `web_fetch` — one HTTP request, the page body returned as Markdown, instead of the shipped anonymous `http` provider.
+- Falls back to the locally mounted `http` provider when the DeepSeek crawler cannot retrieve a page (HTTP 403/404, raw text files, no extractable body), so `web_fetch` still works on those URLs; set `fallbackFetchProvider: none` to keep official fetching only.
 - Keeps a legacy `mode: messages` search backend (Anthropic-compatible Messages endpoint + the native `web_search_20250305` server tool) as an explicit fallback.
 - Ships a bundle patch (`cordis.patch.yml`) that registers both providers and pins `web.searchProvider` / `web.fetchProvider` to them.
 
@@ -105,6 +106,7 @@ Installed as a bundle, the row lives in this package's `cordis.patch.yml`. Overr
 | `sendOriginalQuestion` | `true` | Send `ori_question` (the session's latest user prompt, ≤128 chars) |
 | `fetchMaxChars` | `100000` | Cap on the Markdown characters one fetch returns (the seam marks the result truncated) |
 | `fetchTimeoutMs` | `30000` | Provider-side timeout for one Fetch API request |
+| `fallbackFetchProvider` | `http` | Local provider tried when the official Fetch API cannot retrieve a page; `none` disables the fallback |
 | `apiKey` / `apiKeyEnv` | unset / `DEEPSEEK_API_KEY` | API-key fallback when account sign-in is unavailable |
 | `messagesBaseURL` | `https://api.deepseek.com/anthropic/v1` | Only `mode: messages` (`/messages` is appended) |
 | `model` | `deepseek-flash` | Only `mode: messages` |
@@ -124,7 +126,7 @@ Installed as a bundle, the row lives in this package's `cordis.patch.yml`. Overr
 
 - The DeepSeek account token is read from the DSH credential service per request (`ctx.deepseekAccount.resolveToken`) and sent only to the `api.deepseek.com` origin; the account service validates the origin.
 - The plugin never writes the token to disk and never exposes it to the browser.
-- Fetches are performed by DeepSeek's server, so the target URL leaves your machine to the DeepSeek API rather than being fetched locally. Pin `fetchProvider: http` if you want the shipped local transport instead.
+- Fetches are performed by DeepSeek's server, so the target URL leaves your machine to the DeepSeek API rather than being fetched locally. Only when the official fetch fails with a content error (403/404 or no body) does the page get fetched locally through the shipped `http` provider; pin `fetchProvider: http` or set `fallbackFetchProvider: none` if you never want local fetching.
 - No runtime dependencies, no install scripts: plain ESM using `node:` built-ins and the global `fetch`.
 
 ## Requirements
@@ -141,6 +143,7 @@ Installed as a bundle, the row lives in this package's `cordis.patch.yml`. Overr
 NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
 "$NODE" scripts/verify.mjs "query"                          # official Search API, ~0.4–0.6 s, snippets included
 "$NODE" scripts/verify.mjs --fetch "https://example.com"    # official Fetch API, Markdown body
+"$NODE" scripts/verify.mjs --fetch-fallback "<url>"         # official 403/404 triggers the local fallback
 "$NODE" scripts/verify.mjs "query" --messages               # legacy Messages backend, ~4–6 s
 ```
 

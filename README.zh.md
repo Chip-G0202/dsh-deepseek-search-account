@@ -35,6 +35,7 @@ ctx.get("agents")?.currentInitiator()?.session.requestContext()?.provider === "d
 - 在 `ctx.web` seam 上注册搜索提供方 `deepseek-account-search` 和抓取提供方 `deepseek-account-fetch`；
 - 默认走 **DeepSeek 官方 Search API**（`POST https://api.deepseek.com/v1/tools/search`）：一次请求约 0.5–1 秒，返回 `title` / `url` / `snippet` / `date`，不产生辅助模型轮次、不消耗模型 token；
 - `web_fetch` 走 **DeepSeek 官方 Fetch API**（`POST https://api.deepseek.com/v1/tools/fetch`）：一次请求，返回 Markdown 正文，替代自带的匿名 `http` 抓取；
+- 官方抓取失败（HTTP 403/404、纯文本文件、无法提取正文）时，自动回退到本机挂载的 `http` 提供方，保证这类 URL 仍可抓取；把 `fallbackFetchProvider` 设为 `none` 可关闭回退；
 - 保留旧的 `mode: messages` 搜索后端（Anthropic 兼容 Messages + 原生 `web_search_20250305` 服务端工具）作为显式回退；
 - 自带 bundle 补丁 `cordis.patch.yml`：注册两个提供方，并把 `web.searchProvider` / `web.fetchProvider` 都固定到它们。
 
@@ -103,6 +104,7 @@ dsh plugin --profile desktop add https://github.com/Chip-G0202/dsh-deepseek-sear
 | `sendOriginalQuestion` | `true` | 是否发送 `ori_question`（会话最近一条用户提问，≤128 字符） |
 | `fetchMaxChars` | `100000` | 单次抓取返回的 Markdown 字符上限（超出会标记 truncated） |
 | `fetchTimeoutMs` | `30000` | 单次 Fetch API 请求的提供方超时 |
+| `fallbackFetchProvider` | `http` | 官方抓取无法获取页面时使用的本机提供方；`none` 表示不回退 |
 | `apiKey` / `apiKeyEnv` | 未设置 / `DEEPSEEK_API_KEY` | 账号登录不可用时的 API Key 回退 |
 | `messagesBaseURL` | `https://api.deepseek.com/anthropic/v1` | 仅 `mode: messages`（追加 `/messages`） |
 | `model` | `deepseek-flash` | 仅 `mode: messages` |
@@ -122,7 +124,7 @@ dsh plugin --profile desktop add https://github.com/Chip-G0202/dsh-deepseek-sear
 
 - DeepSeek 账号 token 每次请求从 DSH 凭据服务读取（`ctx.deepseekAccount.resolveToken`），并且只发往 `api.deepseek.com`（账号服务会校验 origin）。
 - 插件不把 token 写入磁盘，也不把 token 暴露给浏览器。
-- 抓取由 DeepSeek 服务端完成：目标 URL 会发往 DeepSeek API，而不是在本机发起请求。若想继续用官方的本地匿名抓取，把 `fetchProvider` 设为 `http`。
+- 抓取由 DeepSeek 服务端完成：目标 URL 会发往 DeepSeek API，而不是在本机发起请求。仅当官方抓取因内容原因失败（403/404 或无正文）时，才会用自带的 `http` 提供方在本机再抓一次；若完全不想本地抓取，把 `fetchProvider` 设为 `http` 或设置 `fallbackFetchProvider: none`。
 - 零运行时依赖、无安装脚本：纯 ESM，只用 `node:` 内建模块和全局 `fetch`。
 
 ## 要求
@@ -139,6 +141,7 @@ dsh plugin --profile desktop add https://github.com/Chip-G0202/dsh-deepseek-sear
 NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
 "$NODE" scripts/verify.mjs "查询词"                       # 官方 Search API，约 0.4–0.6 秒，带 snippet
 "$NODE" scripts/verify.mjs --fetch "https://example.com" # 官方 Fetch API，返回 Markdown 正文
+"$NODE" scripts/verify.mjs --fetch-fallback "<url>"      # 官方 403/404 时验证本地回退
 "$NODE" scripts/verify.mjs "查询词" --messages            # 旧 Messages 后端，约 4–6 秒
 ```
 

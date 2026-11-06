@@ -43,8 +43,14 @@
  * (`POST https://api.deepseek.com/v1/tools/fetch`) instead of the shipped
  * anonymous `http` provider: one plain request, page content returned as
  * Markdown, billed on the same account quota (5 元 / 1000 successful requests
- * since 2026-11-01 00:00 Beijing; failed fetches are not billed). Set
- * `fetchEnabled: false` to leave `web_fetch` on the shipped provider.
+ * since 2026-11-01 00:00 Beijing; failed fetches are not billed).
+ *
+ * Not every page is retrievable by the DeepSeek crawler (raw text files,
+ * some anti-bot sites), so when the official Fetch API cannot produce a page
+ * (HTTP 403/404 or no extractable body) the provider falls back to the locally
+ * mounted provider named by `fallbackFetchProvider` — the shipped anonymous
+ * `http` one by default — and only reports an error if that fails too. Set
+ * `fallbackFetchProvider: none` to disable the fallback.
  *
  * Authentication
  * --------------
@@ -83,6 +89,8 @@ const DEFAULT_MAX_USES = 5;
 const DEFAULT_FETCH_MAX_CHARS = 100_000;
 /** Default provider-side timeout for one Fetch API request (ms). */
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+/** Local provider tried when the official Fetch API cannot retrieve a page. */
+const DEFAULT_FALLBACK_FETCH_PROVIDER = "http";
 /** Longest URL the Fetch API accepts, in characters. */
 const FETCH_URL_MAX_CHARS = 8192;
 /** Longest `ori_question` the Search API accepts, in characters. */
@@ -140,7 +148,13 @@ function readOptions(config) {
 		apiKeyEnv: typeof config.apiKeyEnv === "string" && config.apiKeyEnv.length > 0 ? config.apiKeyEnv : "DEEPSEEK_API_KEY",
 		sendOriginalQuestion: config.sendOriginalQuestion !== false,
 		fetchMaxChars: isPositiveInteger(config.fetchMaxChars) ? config.fetchMaxChars : DEFAULT_FETCH_MAX_CHARS,
-		fetchTimeoutMs: isPositiveInteger(config.fetchTimeoutMs) ? config.fetchTimeoutMs : DEFAULT_FETCH_TIMEOUT_MS
+		fetchTimeoutMs: isPositiveInteger(config.fetchTimeoutMs) ? config.fetchTimeoutMs : DEFAULT_FETCH_TIMEOUT_MS,
+		fallbackFetchProvider:
+			config.fallbackFetchProvider === false || config.fallbackFetchProvider === "none"
+				? ""
+				: typeof config.fallbackFetchProvider === "string" && config.fallbackFetchProvider.length > 0
+					? config.fallbackFetchProvider
+					: DEFAULT_FALLBACK_FETCH_PROVIDER
 	};
 }
 
@@ -382,7 +396,9 @@ async function postJson(endpoint, headers, body, signal, authKind, options, scop
 			if (signal?.aborted === true || isAbortError(error)) throw webError(`DeepSeek ${scope} aborted`, "WEB_ABORTED", error);
 		}
 		if (response.status === 401 && authKind === "account") throw accountRejectedError(statusMessage(scope, 401, detail));
-		throw endpointError(options, endpoint, statusMessage(scope, response.status, detail), undefined, scope);
+		const failure = endpointError(options, endpoint, statusMessage(scope, response.status, detail), undefined, scope);
+		failure.httpStatus = response.status;
+		throw failure;
 	}
 	try {
 		return await response.json();
@@ -490,6 +506,27 @@ function withFetchTimeout(signal, timeoutMs) {
 	return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, timeout]) : signal;
 }
 
+/** Resolve a locally-registered fallback fetch provider (default: the shipped `http` one). */
+function localFetchFallback(ctx, options) {
+	if (options.fallbackFetchProvider.length === 0) return undefined;
+	const providers = ctx.web?.fetchProviders;
+	if (!(providers instanceof Map)) return undefined;
+	const provider = providers.get(options.fallbackFetchProvider);
+	if (provider === undefined || provider === null || provider.id === FETCH_PROVIDER_ID) return undefined;
+	if (typeof provider.fetch !== "function") return undefined;
+	try {
+		if (typeof provider.available === "function" && provider.available() === false) return undefined;
+	} catch {
+		return undefined;
+	}
+	return provider;
+}
+
+/** True when an official Fetch failure means "this page is not retrievable server-side". */
+function shouldTryLocalFallback(error) {
+	return error?.httpStatus === 403 || error?.httpStatus === 404 || error?.retryLocal === true;
+}
+
 /**
  * Create the DeepSeek-account-backed fetch provider.
  *
@@ -499,10 +536,46 @@ function withFetchTimeout(signal, timeoutMs) {
  * The same account sign-in (or `DEEPSEEK_API_KEY`) used for search authenticates
  * the request, and a successful fetch is billed on the same account quota.
  *
- * @param ctx - plugin context; sign-in and credentials are read lazily per fetch.
+ * Pages the DeepSeek crawler cannot turn into a body (HTTP 403/404, raw text
+ * files, no extractable Markdown) fall back to the locally mounted provider
+ * named by `fallbackFetchProvider` (default `http`), so `web_fetch` keeps
+ * working on those URLs; `fallbackFetchProvider: none` disables the fallback.
+ *
+ * @param ctx - plugin context; sign-in, credentials and the fallback provider
+ *   registry are read lazily per fetch.
  * @param config - the row config (baseURL/fetchMaxChars/fetchTimeoutMs/apiKey/...).
  */
 export function createFetchProvider(ctx, config = {}) {
+	/** Fetch one URL through the official Fetch API (`POST /v1/tools/fetch`). */
+	const fetchOfficial = async (request, signal, options) => {
+		throwIfAborted(signal);
+		const target = validateFetchUrl(request?.url);
+		const endpoint = `${options.searchBaseURL}/fetch`;
+		const auth = await resolveAuth(ctx, endpoint, options, signal);
+		const effectiveSignal = withFetchTimeout(signal, options.fetchTimeoutMs);
+		const payload = await postJson(
+			endpoint,
+			auth.headers,
+			{ url: target.toString() },
+			effectiveSignal,
+			auth.kind,
+			options,
+			"fetch"
+		);
+		if (typeof payload?.content !== "string" || payload.content.length === 0) {
+			const failure = webError("DeepSeek Fetch API returned no page content", "WEB_PROVIDER_ERROR");
+			failure.retryLocal = true;
+			throw failure;
+		}
+		const content = payload.content.slice(0, options.fetchMaxChars);
+		return {
+			url: target.toString(),
+			statusCode: 200,
+			body: { kind: "text", content },
+			truncated: content.length !== payload.content.length
+		};
+	};
+
 	return {
 		id: FETCH_PROVIDER_ID,
 
@@ -516,33 +589,24 @@ export function createFetchProvider(ctx, config = {}) {
 			);
 		},
 
-		/** Fetch one URL through the official Fetch API (`POST /v1/tools/fetch`). */
+		/** Fetch one URL officially, falling back locally when the page is not retrievable. */
 		async fetch(request, signal) {
 			const options = readOptions(config);
-			throwIfAborted(signal);
-			const target = validateFetchUrl(request?.url);
-			const endpoint = `${options.searchBaseURL}/fetch`;
-			const auth = await resolveAuth(ctx, endpoint, options, signal);
-			const effectiveSignal = withFetchTimeout(signal, options.fetchTimeoutMs);
-			const payload = await postJson(
-				endpoint,
-				auth.headers,
-				{ url: target.toString() },
-				effectiveSignal,
-				auth.kind,
-				options,
-				"fetch"
-			);
-			if (typeof payload?.content !== "string" || payload.content.length === 0) {
-				throw webError("DeepSeek Fetch API returned no page content", "WEB_PROVIDER_ERROR");
+			try {
+				return await fetchOfficial(request, signal, options);
+			} catch (error) {
+				const fallback = shouldTryLocalFallback(error) ? localFetchFallback(ctx, options) : undefined;
+				if (fallback === undefined) throw error;
+				try {
+					return await fallback.fetch(request, signal);
+				} catch (fallbackError) {
+					throw webError(
+						`${error.message}\n\nAlso failed with the local "${fallback.id}" provider: ${fallbackError.message}`,
+						"WEB_PROVIDER_ERROR",
+						fallbackError
+					);
+				}
 			}
-			const content = payload.content.slice(0, options.fetchMaxChars);
-			return {
-				url: target.toString(),
-				statusCode: 200,
-				body: { kind: "text", content },
-				truncated: content.length !== payload.content.length
-			};
 		}
 	};
 }
